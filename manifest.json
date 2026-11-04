@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.frostmute.omaindrop",
+  "name": "Omaindrop",
+  "version": "1.0.0",
+  "author": "frostmute",
+  "license": "MIT",
+  "description": "Raindrop.io in your Omarchy bar: Unsorted inbox badge, quick save of clipboard links and screenshots into any collection with tags, search, triage in a floating/tiling Hyprland window, and a one-click pull to your Obsidian vault via Make It Rain.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Window.qml"
+  },
+  "barWidget": {
+    "displayName": "Omaindrop",
+    "description": "Raindrop.io bookmarks in your status bar and desktop window",
+    "category": "Productivity",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

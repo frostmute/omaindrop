@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#070b13"/><stop offset="55%" stop-color="#0d1526"/><stop offset="100%" stop-color="#080c15"/>
+    </linearGradient>
+    <linearGradient id="drop" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+    <radialGradient id="orb" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.22"/><stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="card" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141e30"/><stop offset="100%" stop-color="#0d1422"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <circle cx="230" cy="250" r="320" fill="url(#orb)"/>
+  <circle cx="1010" cy="430" r="360" fill="url(#orb)"/>
+  <g stroke="#1e293b" stroke-width="1" opacity="0.3">
+    <path d="M0 90H1280M0 180H1280M0 270H1280M0 360H1280M0 450H1280M0 540H1280M0 630H1280"/>
+    <path d="M160 0V720M320 0V720M480 0V720M640 0V720M800 0V720M960 0V720M1120 0V720"/>
+  </g>
+
+  <!-- falling drops -->
+  <g fill="url(#drop)" opacity="0.5">
+    <path d="M70 610c0 0-14 18-14 28a14 14 0 0 0 28 0c0-10-14-28-14-28z"/>
+    <path d="M520 600c0 0-10 13-10 20a10 10 0 0 0 20 0c0-7-10-20-10-20z"/>
+    <path d="M610 110c0 0-8 10-8 16a8 8 0 0 0 16 0c0-6-8-16-8-16z"/>
+    <path d="M1240 640c0 0-12 15-12 24a12 12 0 0 0 24 0c0-9-12-24-12-24z"/>
+  </g>
+
+  <!-- title block -->
+  <g font-family="JetBrains Mono, DejaVu Sans Mono, monospace">
+    <path d="M140 200c0 0-46 58-46 90a46 46 0 0 0 92 0c0-32-46-90-46-90z" fill="url(#drop)"/>
+    <text x="214" y="282" font-size="76" font-weight="700" fill="#e2e8f0" letter-spacing="2">omaindrop</text>
+    <text x="218" y="326" font-size="24" fill="#7dd3fc">Raindrop.io for the Omarchy desktop</text>
+    <g font-size="19" fill="#94a3b8">
+      <text x="98" y="420">› Unsorted inbox badge on your bar</text>
+      <text x="98" y="456">› Save clipboard links + screenshots, with tags</text>
+      <text x="98" y="492">› Search, triage, move, retag in a Hyprland window</text>
+      <text x="98" y="528">› Pull to vault through Make It Rain</text>
+    </g>
+  </g>
+
+  <!-- bar strip -->
+  <rect x="700" y="96" width="500" height="34" rx="8" fill="#0b111d" stroke="#1f2a3d"/>
+  <g font-family="JetBrains Mono, DejaVu Sans Mono, monospace" font-size="15" fill="#94a3b8">
+    <text x="720" y="118">●  1  2  3</text>
+    <text x="1040" y="118">10:24</text>
+  </g>
+  <path d="M1132 104c0 0-9 11-9 17a9 9 0 0 0 18 0c0-6-9-17-9-17z" fill="#38bdf8"/>
+  <rect x="1142" y="98" width="26" height="16" rx="8" fill="#38bdf8" stroke="#0b111d" stroke-width="2"/>
+  <text x="1155" y="111" font-family="DejaVu Sans, sans-serif" font-size="11" font-weight="700" fill="#0b111d" text-anchor="middle">12</text>
+
+  <!-- popup card -->
+  <rect x="790" y="146" width="410" height="480" rx="12" fill="url(#card)" stroke="#38bdf8" stroke-opacity="0.55"/>
+  <g font-family="JetBrains Mono, DejaVu Sans Mono, monospace">
+    <text x="812" y="182" font-size="17" font-weight="700" fill="#e2e8f0">Omaindrop</text>
+    <rect x="918" y="166" width="104" height="22" rx="11" fill="#38bdf8" fill-opacity="0.14" stroke="#38bdf8" stroke-opacity="0.45"/>
+    <text x="970" y="182" font-size="12" fill="#38bdf8" text-anchor="middle">12 unsorted</text>
+    <rect x="810" y="202" width="330" height="32" rx="6" fill="#0b111d" stroke="#2a3850"/>
+    <text x="822" y="223" font-size="13" fill="#64748b">Enter saves https://quickshell.org…</text>
+    <rect x="1148" y="202" width="32" height="32" rx="6" fill="#0284c7"/>
+    <text x="1164" y="224" font-size="18" fill="#e0f2fe" text-anchor="middle">+</text>
+    <rect x="810" y="242" width="150" height="30" rx="6" fill="#0b111d" stroke="#2a3850"/>
+    <text x="822" y="262" font-size="12" fill="#cbd5e1">Gamedev  ▾</text>
+    <rect x="968" y="242" width="212" height="30" rx="6" fill="#0b111d" stroke="#2a3850"/>
+    <text x="980" y="262" font-size="12" fill="#64748b">godot, shaders</text>
+    <rect x="810" y="288" width="370" height="30" rx="6" fill="#0b111d" stroke="#2a3850"/>
+    <text x="822" y="308" font-size="12" fill="#64748b">Search all bookmarks (#tag works too)…</text>
+    <rect x="810" y="330" width="108" height="22" rx="4" fill="#38bdf8"/>
+    <text x="864" y="345" font-size="11" font-weight="700" fill="#0b111d" text-anchor="middle">Unsorted (12)</text>
+    <rect x="924" y="330" width="80" height="22" rx="4" fill="#1a2436" stroke="#2a3850"/>
+    <text x="964" y="345" font-size="11" fill="#cbd5e1" text-anchor="middle">All (2,341)</text>
+    <g font-size="13">
+      <rect x="810" y="366" width="370" height="50" rx="6" fill="#1a2436"/>
+      <rect x="820" y="377" width="28" height="28" rx="5" fill="#38bdf8" fill-opacity="0.16"/><text x="834" y="397" fill="#38bdf8" text-anchor="middle" font-weight="700">Q</text>
+      <text x="858" y="387" fill="#e2e8f0">Quickshell docs — Process</text><text x="858" y="405" font-size="11" fill="#64748b">quickshell.org  ·  #omarchy #qml</text>
+      <rect x="820" y="433" width="28" height="28" rx="5" fill="#38bdf8" fill-opacity="0.16"/><text x="834" y="453" fill="#38bdf8" text-anchor="middle" font-weight="700">G</text>
+      <text x="858" y="443" fill="#e2e8f0">Godot 4.7: typed dictionaries</text><text x="858" y="461" font-size="11" fill="#64748b">godotengine.org  ·  3 highlights</text>
+      <rect x="820" y="489" width="28" height="28" rx="5" fill="#38bdf8" fill-opacity="0.16"/><text x="834" y="509" fill="#38bdf8" text-anchor="middle" font-weight="700">L</text>
+      <text x="858" y="499" fill="#e2e8f0">Lospec palette list</text><text x="858" y="517" font-size="11" fill="#64748b">lospec.com  ·  #pixelart</text>
+      <rect x="820" y="545" width="28" height="28" rx="5" fill="#38bdf8" fill-opacity="0.16"/><text x="834" y="565" fill="#38bdf8" text-anchor="middle" font-weight="700">W</text>
+      <text x="858" y="555" fill="#e2e8f0">Hyprland wiki — window rules</text><text x="858" y="573" font-size="11" fill="#64748b">wiki.hyprland.org  ·  #hyprland</text>
+    </g>
+    <text x="995" y="606" font-size="11" fill="#38bdf8" text-anchor="middle">Saved to Raindrop</text>
+  </g>
+</svg>

@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""omaindrop-backend — Raindrop.io bridge for the Omaindrop Omarchy plugin.
+
+Every command prints exactly one JSON object on stdout and exits 0 when
+`ok` is true, 1 otherwise. Standard library only.
+
+Token lookup order (first hit wins):
+  1. $RAINDROP_TOKEN
+  2. $OMAINDROP_CONFIG (default ~/.config/omaindrop/config.json) -> "token"
+  3. $RAINDROP_TOKEN_FILE (default ~/.config/raindrop/token)  [shared with other Raindrop tools]
+  4. Make It Rain's saved token in an Obsidian vault ("apiToken" in
+     <vault>/.obsidian/plugins/make-it-rain/data.json), unless "useMakeItRainToken": false
+"""
+import argparse
+import json
+import mimetypes
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+API_BASE = os.environ.get("OMAINDROP_API_BASE", "https://api.raindrop.io/rest/v1").rstrip("/")
+HOME = os.path.expanduser("~")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+XDG_CACHE = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+CONFIG_PATH = os.environ.get("OMAINDROP_CONFIG") or os.path.join(XDG_CONFIG, "omaindrop", "config.json")
+TOKEN_FILE = os.environ.get("RAINDROP_TOKEN_FILE") or os.path.join(XDG_CONFIG, "raindrop", "token")
+CACHE_PATH = os.path.join(XDG_CACHE, "omaindrop", "state.json")
+OBSIDIAN_CONFIG = os.environ.get("OMAINDROP_OBSIDIAN_CONFIG") or os.path.join(XDG_CONFIG, "obsidian", "obsidian.json")
+TIMEOUT = float(os.environ.get("OMAINDROP_TIMEOUT", "15"))
+
+UNSORTED = -1
+ALL = 0
+TRASH = -99
+SYSTEM_COLLECTIONS = {
+    ALL: "All bookmarks",
+    UNSORTED: "Unsorted",
+    TRASH: "Trash",
+}
+
+
+class BackendError(Exception):
+    def __init__(self, message, code="error", status=0, retry_after=0):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status = status
+        self.retry_after = retry_after
+
+
+# ---------------------------------------------------------------- output
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return 0 if payload.get("ok") else 1
+
+
+def fail(message, code="error", **extra):
+    payload = {"ok": False, "error": message, "code": code}
+    payload.update(extra)
+    return emit(payload)
+
+
+# ---------------------------------------------------------------- config
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def obsidian_vaults():
+    """Vaults Obsidian knows about, from its own obsidian.json."""
+    try:
+        with open(OBSIDIAN_CONFIG, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    vaults = []
+    for vid, info in (data.get("vaults") or {}).items():
+        path = (info or {}).get("path")
+        if not path or not os.path.isdir(path):
+            continue
+        vaults.append({
+            "id": vid,
+            "name": os.path.basename(os.path.normpath(path)),
+            "path": path,
+            "open": bool((info or {}).get("open")),
+        })
+    return vaults
+
+
+def make_it_rain_vaults():
+    """Vaults that have Make It Rain installed."""
+    found = []
+    for v in obsidian_vaults():
+        plugdir = os.path.join(v["path"], ".obsidian", "plugins")
+        mir = os.path.join(plugdir, "make-it-rain", "manifest.json")
+        if not os.path.isfile(mir):
+            continue
+        version = ""
+        try:
+            with open(mir, "r", encoding="utf-8") as fh:
+                version = json.load(fh).get("version", "")
+        except (OSError, ValueError):
+            pass
+        enabled = True
+        try:
+            with open(os.path.join(v["path"], ".obsidian", "community-plugins.json"), "r", encoding="utf-8") as fh:
+                enabled = "make-it-rain" in json.load(fh)
+        except (OSError, ValueError):
+            pass
+        entry = dict(v)
+        entry["makeItRainVersion"] = version
+        entry["makeItRainEnabled"] = enabled
+        entry["advancedUri"] = os.path.isfile(os.path.join(plugdir, "obsidian-advanced-uri", "manifest.json"))
+        found.append(entry)
+    found.sort(key=lambda e: (not e["open"], e["name"].lower()))
+    return found
+
+
+def resolve_token(config=None):
+    """Returns (token, source) or (None, None)."""
+    config = load_config() if config is None else config
+    env = os.environ.get("RAINDROP_TOKEN", "").strip()
+    if env:
+        return env, "env:RAINDROP_TOKEN"
+    tok = str(config.get("token") or "").strip()
+    if tok:
+        return tok, "config"
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as fh:
+            tok = fh.read().strip()
+        if tok:
+            return tok, "token-file"
+    except OSError:
+        pass
+    if config.get("useMakeItRainToken", True):
+        for v in make_it_rain_vaults():
+            try:
+                with open(os.path.join(v["path"], ".obsidian", "plugins", "make-it-rain", "data.json"), "r", encoding="utf-8") as fh:
+                    tok = str(json.load(fh).get("apiToken") or "").strip()
+                if tok:
+                    return tok, "make-it-rain:" + v["name"]
+            except (OSError, ValueError):
+                continue
+    return None, None
+
+
+# ---------------------------------------------------------------- cache
+
+def read_cache():
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_cache(key, value):
+    data = read_cache()
+    data[key] = {"at": int(time.time()), "value": value}
+    try:
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_PATH), prefix=".state.")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, CACHE_PATH)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- http
+
+class Raindrop:
+    def __init__(self, token, base=API_BASE, timeout=TIMEOUT):
+        self.token = token
+        self.base = base
+        self.timeout = timeout
+
+    def request(self, method, path, params=None, body=None, raw=None, content_type=None):
+        url = self.base + path
+        if params:
+            clean = {k: v for k, v in params.items() if v is not None and v != ""}
+            if clean:
+                url += "?" + urllib.parse.urlencode(clean)
+        headers = {
+            "Authorization": "Bearer " + self.token,
+            "Accept": "application/json",
+            "User-Agent": "omaindrop/1.0 (+https://github.com/frostmute/omaindrop)",
+        }
+        data = None
+        if raw is not None:
+            data = raw
+            headers["Content-Type"] = content_type
+        elif body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                text = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode("utf-8", "replace")).get("errorMessage", "")
+            except Exception:
+                pass
+            if e.code == 401:
+                raise BackendError("Raindrop rejected the token (401). Check your test token.", "unauthorized", 401)
+            if e.code == 429:
+                retry = 60
+                try:
+                    reset = int(e.headers.get("X-RateLimit-Reset", "0"))
+                    if reset:
+                        retry = max(1, reset - int(time.time()))
+                except (TypeError, ValueError):
+                    pass
+                raise BackendError("Raindrop rate limit hit; retry in %ds." % retry, "rate_limited", 429, retry)
+            if e.code == 404:
+                raise BackendError(detail or "Not found (404).", "not_found", 404)
+            raise BackendError(detail or ("Raindrop error %d." % e.code), "http_error", e.code)
+        except urllib.error.URLError as e:
+            raise BackendError("Can't reach Raindrop: %s" % getattr(e, "reason", e), "offline")
+        except (TimeoutError, OSError) as e:
+            raise BackendError("Can't reach Raindrop: %s" % e, "offline")
+        try:
+            data = json.loads(text) if text else {}
+        except ValueError:
+            raise BackendError("Raindrop returned something that isn't JSON.", "bad_response")
+        if isinstance(data, dict) and data.get("result") is False:
+            raise BackendError(data.get("errorMessage") or data.get("error") or "Raindrop said no.", "api_error")
+        return data
+
+    def get(self, path, params=None):
+        return self.request("GET", path, params=params)
+
+
+def client():
+    token, source = resolve_token()
+    if not token:
+        raise BackendError(
+            "No Raindrop token. Put a test token in %s (or set RAINDROP_TOKEN)." % TOKEN_FILE,
+            "no_token",
+        )
+    return Raindrop(token)
+
+
+# ---------------------------------------------------------------- shaping
+
+def shape_item(it):
+    coll = it.get("collection") or {}
+    cid = coll.get("$id", it.get("collectionId"))
+    link = it.get("link") or ""
+    domain = it.get("domain") or urllib.parse.urlparse(link).netloc
+    return {
+        "id": it.get("_id"),
+        "title": it.get("title") or link,
+        "link": link,
+        "domain": domain,
+        "excerpt": it.get("excerpt") or "",
+        "note": it.get("note") or "",
+        "tags": list(it.get("tags") or []),
+        "type": it.get("type") or "link",
+        "cover": it.get("cover") or "",
+        "created": it.get("created") or "",
+        "lastUpdate": it.get("lastUpdate") or "",
+        "collectionId": cid,
+        "highlights": len(it.get("highlights") or []),
+        "important": bool(it.get("important")),
+    }
+
+
+def flatten_collections(roots, children):
+    """Root + child collections into one list, depth-first, with a path title."""
+    by_parent = {}
+    for c in children:
+        pid = (c.get("parent") or {}).get("$id")
+        by_parent.setdefault(pid, []).append(c)
+    for lst in list(by_parent.values()) + [roots]:
+        lst.sort(key=lambda c: (c.get("sort", 0), (c.get("title") or "").lower()))
+    out = []
+
+    def walk(c, depth, trail):
+        title = c.get("title") or "Untitled"
+        path = trail + [title]
+        out.append({
+            "id": c.get("_id"),
+            "title": title,
+            "path": " / ".join(path),
+            "count": c.get("count", 0),
+            "depth": depth,
+            "parentId": (c.get("parent") or {}).get("$id"),
+        })
+        for kid in by_parent.get(c.get("_id"), []):
+            walk(kid, depth + 1, path)
+
+    for r in roots:
+        walk(r, 0, [])
+    return out
+
+
+# ---------------------------------------------------------------- commands
+
+def stats(rd):
+    data = rd.get("/user/stats")
+    counts = {"all": 0, "unsorted": 0, "trash": 0}
+    for row in data.get("items") or []:
+        cid = row.get("_id")
+        if cid == ALL:
+            counts["all"] = row.get("count", 0)
+        elif cid == UNSORTED:
+            counts["unsorted"] = row.get("count", 0)
+        elif cid == TRASH:
+            counts["trash"] = row.get("count", 0)
+    return counts
+
+
+def cmd_count(args):
+    try:
+        counts = stats(client())
+    except BackendError as e:
+        cached = read_cache().get("count")
+        if cached and e.code in ("offline", "rate_limited"):
+            return emit({"ok": True, "counts": cached["value"], "stale": True, "cachedAt": cached["at"], "warning": e.message})
+        raise
+    write_cache("count", counts)
+    return emit({"ok": True, "counts": counts, "stale": False})
+
+
+def fetch_items(rd, collection, search="", limit=25, sort="-created", page=0):
+    perpage = max(1, min(int(limit), 50))
+    data = rd.get("/raindrops/%d" % int(collection), {
+        "search": search or None,
+        "sort": sort,
+        "perpage": perpage,
+        "page": page,
+    })
+    return [shape_item(i) for i in data.get("items") or []], data.get("count", 0)
+
+
+def cmd_recent(args):
+    key = "recent:%s" % args.collection
+    try:
+        items, total = fetch_items(client(), args.collection, limit=args.limit)
+    except BackendError as e:
+        cached = read_cache().get(key)
+        if cached and e.code in ("offline", "rate_limited"):
+            v = cached["value"]
+            return emit({"ok": True, "items": v["items"], "total": v["total"], "collection": args.collection,
+                         "stale": True, "cachedAt": cached["at"], "warning": e.message})
+        raise
+    write_cache(key, {"items": items, "total": total})
+    return emit({"ok": True, "items": items, "total": total, "collection": args.collection, "stale": False})
+
+
+def cmd_search(args):
+    query = " ".join(args.query).strip()
+    if not query:
+        return fail("Nothing to search for.", "bad_input")
+    items, total = fetch_items(client(), args.collection, search=query, limit=args.limit, sort="score" if args.relevance else "-created")
+    return emit({"ok": True, "query": query, "items": items, "total": total, "collection": args.collection})
+
+
+def cmd_collections(args):
+    rd = client()
+    roots = rd.get("/collections").get("items") or []
+    children = rd.get("/collections/childrens").get("items") or []
+    counts = {}
+    try:
+        counts = stats(rd)
+    except BackendError:
+        pass
+    system = [
+        {"id": UNSORTED, "title": "Unsorted", "path": "Unsorted", "count": counts.get("unsorted", 0), "depth": 0, "system": True},
+        {"id": ALL, "title": "All bookmarks", "path": "All bookmarks", "count": counts.get("all", 0), "depth": 0, "system": True},
+    ]
+    flat = flatten_collections(roots, children)
+    write_cache("collections", flat)
+    return emit({"ok": True, "system": system, "collections": flat})
+
+
+def cmd_tags(args):
+    path = "/tags" if args.collection is None else "/tags/%d" % args.collection
+    rows = client().get(path).get("items") or []
+    tags = [{"name": r.get("_id"), "count": r.get("count", 0)} for r in rows if r.get("_id")]
+    tags.sort(key=lambda t: (-t["count"], t["name"].lower()))
+    return emit({"ok": True, "tags": tags[: args.limit] if args.limit else tags})
+
+
+def split_tags(raw):
+    out = []
+    for chunk in (raw or "").replace("#", " ").replace(";", ",").split(","):
+        t = chunk.strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def normalise_url(url):
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "://" not in url and "." in url and " " not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return url
+
+
+def read_clipboard():
+    for cmd in (["wl-paste", "--no-newline", "--type", "text/plain"], ["wl-paste", "--no-newline"],
+                ["xclip", "-o", "-selection", "clipboard"]):
+        if shutil.which(cmd[0]):
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                if res.returncode == 0:
+                    return res.stdout.strip()
+            except Exception:
+                continue
+    return ""
+
+
+def default_collection(config):
+    try:
+        return int(config.get("defaultCollection", UNSORTED))
+    except (TypeError, ValueError):
+        return UNSORTED
+
+
+def cmd_clipboard(args):
+    text = read_clipboard()
+    url = normalise_url(text.split()[0]) if text else ""
+    return emit({"ok": True, "text": text[:2048], "url": url})
+
+
+def cmd_save(args):
+    config = load_config()
+    raw = args.url
+    if not raw:
+        clip = read_clipboard().split()
+        raw = clip[0] if clip else ""
+    url = normalise_url(raw)
+    if not url:
+        return fail("That doesn't look like a link (http/https).", "bad_input")
+    collection = args.collection if args.collection is not None else default_collection(config)
+    tags = split_tags(args.tags)
+    body = {"link": url, "collection": {"$id": collection}, "pleaseParse": {}}
+    if tags:
+        body["tags"] = tags
+    if args.title:
+        body["title"] = args.title
+    if args.note:
+        body["note"] = args.note
+    data = client().request("POST", "/raindrop", body=body)
+    return emit({"ok": True, "item": shape_item(data.get("item") or {}), "message": "Saved to Raindrop"})
+
+
+def multipart(fields, file_field, filename, payload, mime):
+    boundary = "omaindrop-" + uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, name, value)).encode("utf-8"))
+    parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"
+                  % (boundary, file_field, filename, mime)).encode("utf-8"))
+    parts.append(payload)
+    parts.append(("\r\n--%s--\r\n" % boundary).encode("utf-8"))
+    return b"".join(parts), "multipart/form-data; boundary=" + boundary
+
+
+def capture_screenshot(region=True):
+    if not shutil.which("grim"):
+        raise BackendError("Screenshot needs grim (and slurp for a region).", "missing_dep")
+    fd, path = tempfile.mkstemp(prefix="omaindrop-", suffix=".png")
+    os.close(fd)
+    cmd = ["grim"]
+    if region:
+        if not shutil.which("slurp"):
+            raise BackendError("Region screenshots need slurp.", "missing_dep")
+        sel = subprocess.run(["slurp"], capture_output=True, text=True, timeout=120)
+        if sel.returncode != 0 or not sel.stdout.strip():
+            os.unlink(path)
+            raise BackendError("Screenshot cancelled.", "cancelled")
+        cmd += ["-g", sel.stdout.strip()]
+    res = subprocess.run(cmd + [path], capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        os.unlink(path)
+        raise BackendError("grim failed: %s" % (res.stderr.strip() or res.returncode), "capture_failed")
+    return path
+
+
+def upload_file(rd, path, collection, tags=None, title=None):
+    with open(path, "rb") as fh:
+        payload = fh.read()
+    name = os.path.basename(path)
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    raw, ctype = multipart({"collectionId": str(collection)}, "file", name, payload, mime)
+    data = rd.request("PUT", "/raindrop/file", raw=raw, content_type=ctype)
+    item = data.get("item") or {}
+    patch = {}
+    if tags:
+        patch["tags"] = tags
+    if title:
+        patch["title"] = title
+    if patch and item.get("_id") is not None:
+        item = rd.request("PUT", "/raindrop/%s" % item["_id"], body=patch).get("item") or item
+    return shape_item(item)
+
+
+def cmd_screenshot(args):
+    config = load_config()
+    collection = args.collection if args.collection is not None else default_collection(config)
+    rd = client()
+    path = args.file or capture_screenshot(region=not args.full)
+    try:
+        item = upload_file(rd, path, collection, split_tags(args.tags), args.title or time.strftime("Screenshot %Y-%m-%d %H:%M"))
+    finally:
+        if not args.file and not args.keep:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return emit({"ok": True, "item": item, "message": "Screenshot saved to Raindrop"})
+
+
+def cmd_move(args):
+    data = client().request("PUT", "/raindrop/%d" % args.id, body={"collection": {"$id": args.collection}})
+    return emit({"ok": True, "item": shape_item(data.get("item") or {}), "message": "Moved"})
+
+
+def cmd_tag(args):
+    rd = client()
+    tags = split_tags(args.tags)
+    if args.append:
+        current = shape_item(rd.get("/raindrop/%d" % args.id).get("item") or {})["tags"]
+        tags = current + [t for t in tags if t not in current]
+    data = rd.request("PUT", "/raindrop/%d" % args.id, body={"tags": tags})
+    return emit({"ok": True, "item": shape_item(data.get("item") or {}), "message": "Tags updated"})
+
+
+def cmd_delete(args):
+    client().request("DELETE", "/raindrop/%d" % args.id)
+    return emit({"ok": True, "id": args.id, "message": "Moved to Trash"})
+
+
+def launch(cmd):
+    if not shutil.which(cmd[0]):
+        return False
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return True
+
+
+def cmd_open(args):
+    target = args.url or "https://app.raindrop.io/my/%d" % UNSORTED
+    if not target.startswith(("http://", "https://", "obsidian://")):
+        return fail("Refusing to open a non-web link.", "bad_input")
+    for opener in (["omarchy-launch-webapp", target] if args.app else None, ["xdg-open", target]):
+        if opener and launch(opener):
+            return emit({"ok": True, "launched": opener[0]})
+    return fail("No opener found (xdg-open).", "missing_dep")
+
+
+def cmd_copy(args):
+    text = args.text or ""
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(cmd[0]):
+            try:
+                res = subprocess.run(cmd, input=text, text=True, timeout=3)
+                if res.returncode == 0:
+                    return emit({"ok": True, "message": "Copied"})
+            except Exception:
+                continue
+    return fail("No clipboard tool found (wl-copy).", "missing_dep")
+
+
+def cmd_vault(args):
+    vaults = make_it_rain_vaults()
+    config = load_config()
+    preferred = config.get("vault")
+    chosen = None
+    for v in vaults:
+        if preferred and v["name"] == preferred:
+            chosen = v
+            break
+    if not chosen and vaults:
+        chosen = vaults[0]
+    return emit({"ok": True, "available": bool(vaults), "vaults": vaults, "vault": chosen,
+                 "obsidian": bool(shutil.which("obsidian") or shutil.which("xdg-open"))})
+
+
+def cmd_pull(args):
+    """Hand off to Make It Rain inside Obsidian.
+
+    With Advanced URI installed we can fire the command directly; otherwise we
+    open the vault and Make It Rain's fetch is one Ctrl+P away.
+    """
+    config = load_config()
+    vaults = make_it_rain_vaults()
+    if not vaults:
+        return fail("Make It Rain isn't installed in any Obsidian vault.", "not_available")
+    name = args.vault or config.get("vault")
+    vault = next((v for v in vaults if v["name"] == name), None) if name else None
+    vault = vault or vaults[0]
+    command = args.command or config.get("pullCommand") or "make-it-rain:fetch-raindrops"
+    if vault["advancedUri"]:
+        uri = "obsidian://adv-uri?" + urllib.parse.urlencode({"vault": vault["name"], "commandid": command}, quote_via=urllib.parse.quote)
+        mode = "command"
+    else:
+        uri = "obsidian://open?" + urllib.parse.urlencode({"vault": vault["name"]}, quote_via=urllib.parse.quote)
+        mode = "open-vault"
+    if args.dry_run:
+        return emit({"ok": True, "uri": uri, "mode": mode, "vault": vault["name"]})
+    if not launch(["xdg-open", uri]):
+        return fail("xdg-open not found.", "missing_dep")
+    msg = "Make It Rain is fetching in %s" % vault["name"] if mode == "command" else \
+        "Opened %s — run “Make It Rain: Fetch raindrops” (install Advanced URI to skip this step)" % vault["name"]
+    return emit({"ok": True, "uri": uri, "mode": mode, "vault": vault["name"], "message": msg})
+
+
+def cmd_status(args):
+    token, source = resolve_token()
+    config = load_config()
+    out = {"ok": True, "token": bool(token), "tokenSource": source, "tokenFile": TOKEN_FILE,
+           "configPath": CONFIG_PATH, "defaultCollection": default_collection(config),
+           "makeItRain": bool(make_it_rain_vaults())}
+    if token and args.check:
+        try:
+            me = Raindrop(token).get("/user").get("user") or {}
+            out["user"] = {"name": me.get("fullName") or me.get("name") or "", "pro": bool(me.get("pro"))}
+        except BackendError as e:
+            out["ok"] = False
+            out["error"] = e.message
+            out["code"] = e.code
+    return emit(out)
+
+
+def cmd_set_token(args):
+    token = (args.token or sys.stdin.readline()).strip()
+    if not token:
+        return fail("Empty token.", "bad_input")
+    if not args.no_check:
+        try:
+            Raindrop(token).get("/user")
+        except BackendError as e:
+            return fail(e.message, e.code)
+    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    fd = os.open(TOKEN_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(token + "\n")
+    os.replace(TOKEN_FILE + ".tmp", TOKEN_FILE)
+    return emit({"ok": True, "tokenFile": TOKEN_FILE, "message": "Token saved"})
+
+
+# ---------------------------------------------------------------- cli
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="omaindrop-backend", description="Raindrop.io bridge for Omaindrop")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("count", help="Unsorted / all / trash counts")
+
+    s = sub.add_parser("recent", help="Newest items in a collection")
+    s.add_argument("--collection", type=int, default=UNSORTED)
+    s.add_argument("--limit", type=int, default=25)
+
+    s = sub.add_parser("search", help="Search bookmarks")
+    s.add_argument("query", nargs="+")
+    s.add_argument("--collection", type=int, default=ALL)
+    s.add_argument("--limit", type=int, default=30)
+    s.add_argument("--relevance", action="store_true")
+
+    sub.add_parser("collections", help="Every collection, nested")
+
+    s = sub.add_parser("tags", help="Tags, most used first")
+    s.add_argument("--collection", type=int, default=None)
+    s.add_argument("--limit", type=int, default=0)
+
+    sub.add_parser("clipboard", help="What's on the clipboard, and whether it's a link")
+
+    s = sub.add_parser("save", help="Save a link (defaults to the clipboard)")
+    s.add_argument("url", nargs="?")
+    s.add_argument("--collection", type=int, default=None)
+    s.add_argument("--tags", default="")
+    s.add_argument("--title", default="")
+    s.add_argument("--note", default="")
+
+    s = sub.add_parser("screenshot", help="Capture a screenshot and upload it")
+    s.add_argument("--collection", type=int, default=None)
+    s.add_argument("--tags", default="")
+    s.add_argument("--title", default="")
+    s.add_argument("--full", action="store_true", help="whole screen instead of a region")
+    s.add_argument("--file", default="", help="upload this image instead of capturing")
+    s.add_argument("--keep", action="store_true")
+
+    s = sub.add_parser("move", help="Move an item to a collection")
+    s.add_argument("id", type=int)
+    s.add_argument("collection", type=int)
+
+    s = sub.add_parser("tag", help="Set (or --append) tags on an item")
+    s.add_argument("id", type=int)
+    s.add_argument("tags")
+    s.add_argument("--append", action="store_true")
+
+    s = sub.add_parser("delete", help="Move an item to Trash")
+    s.add_argument("id", type=int)
+
+    s = sub.add_parser("open", help="Open a link (or Raindrop itself)")
+    s.add_argument("url", nargs="?")
+    s.add_argument("--app", action="store_true", help="open as an Omarchy web app")
+
+    s = sub.add_parser("copy", help="Copy text to the clipboard")
+    s.add_argument("text")
+
+    sub.add_parser("vault", help="Find Obsidian vaults with Make It Rain")
+
+    s = sub.add_parser("pull", help="Pull to vault via Make It Rain")
+    s.add_argument("--vault", default="")
+    s.add_argument("--command", default="")
+    s.add_argument("--dry-run", action="store_true")
+
+    s = sub.add_parser("status", help="Token and config status")
+    s.add_argument("--check", action="store_true", help="also verify the token with Raindrop")
+
+    s = sub.add_parser("set-token", help="Save a test token (arg or stdin)")
+    s.add_argument("token", nargs="?")
+    s.add_argument("--no-check", action="store_true")
+    return p
+
+
+COMMANDS = {
+    "count": cmd_count, "recent": cmd_recent, "search": cmd_search, "collections": cmd_collections,
+    "tags": cmd_tags, "clipboard": cmd_clipboard, "save": cmd_save, "screenshot": cmd_screenshot,
+    "move": cmd_move, "tag": cmd_tag, "delete": cmd_delete, "open": cmd_open, "copy": cmd_copy, "vault": cmd_vault,
+    "pull": cmd_pull, "status": cmd_status, "set-token": cmd_set_token,
+}
+
+
+def main(argv=None):
+    parser = build_parser()
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        return fail("Missing command. Try: count, recent, search, save, collections, tags.", "bad_input")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        if e.code == 0:
+            return 0
+        return fail("Bad arguments: %s" % " ".join(argv), "bad_input")
+    handler = COMMANDS.get(args.cmd)
+    if not handler:
+        return fail("Unknown command: %s" % args.cmd, "bad_input")
+    try:
+        return handler(args)
+    except BackendError as e:
+        extra = {"retryAfter": e.retry_after} if e.retry_after else {}
+        return fail(e.message, e.code, **extra)
+    except KeyboardInterrupt:
+        return fail("Interrupted.", "cancelled")
+    except Exception as e:  # never leak a traceback into the bar
+        return fail("%s: %s" % (type(e).__name__, e), "internal")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
