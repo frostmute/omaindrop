@@ -185,9 +185,9 @@ class BackendTests(unittest.TestCase):
         e.update(extra)
         return e
 
-    def run_backend(self, *args, **env):
+    def run_backend(self, *args, input_text=None, **env):
         res = subprocess.run([sys.executable, BACKEND] + list(args), capture_output=True, text=True,
-                             timeout=30, env=self.env(**env))
+                             input=input_text, timeout=30, env=self.env(**env))
         self.assertEqual(res.stdout.count("\n"), 1, "exactly one JSON line: %r %r" % (res.stdout, res.stderr))
         data = json.loads(res.stdout)
         self.assertEqual(res.returncode, 0 if data.get("ok") else 1)
@@ -381,12 +381,24 @@ class BackendTests(unittest.TestCase):
 
     def test_set_token_verifies_and_writes_private_file(self):
         os.remove(os.path.join(self.home, ".config", "raindrop", "token"))
-        self.assertEqual(self.run_backend("set-token", "wrong")["code"], "unauthorized")
-        d = self.run_backend("set-token", TOKEN)
+        self.assertEqual(self.run_backend("set-token", input_text="wrong\n")["code"], "unauthorized")
+        d = self.run_backend("set-token", input_text=TOKEN + "\n")
         self.assertTrue(d["ok"])
         path = os.path.join(self.home, ".config", "raindrop", "token")
         self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
         self.assertTrue(self.run_backend("status", "--check")["user"]["pro"])
+
+    def test_set_token_does_not_reuse_readable_temporary_file(self):
+        path = os.path.join(self.home, ".config", "raindrop", "token")
+        with open(path + ".tmp", "w") as fh:
+            fh.write("existing data")
+        os.chmod(path + ".tmp", 0o644)
+        result = subprocess.run([sys.executable, BACKEND, "set-token", "--no-check"],
+                                input=TOKEN + "\n", capture_output=True, text=True, env=self.env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        with open(path + ".tmp") as fh:
+            self.assertEqual(fh.read(), "existing data")
 
     # --- make it rain
 

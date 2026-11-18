@@ -658,10 +658,14 @@ def cmd_set_token(args):
         except BackendError as e:
             return fail(e.message, e.code)
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-    fd = os.open(TOKEN_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(token + "\n")
-    os.replace(TOKEN_FILE + ".tmp", TOKEN_FILE)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(TOKEN_FILE), prefix=".token.")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(token + "\n")
+        os.replace(tmp, TOKEN_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return emit({"ok": True, "tokenFile": TOKEN_FILE, "message": "Token saved"})
 
 
