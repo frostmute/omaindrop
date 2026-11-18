@@ -236,12 +236,13 @@ Item {
 
   // ---------------------------------------------------------------- plumbing
 
-  // args: backend arguments; cb(result); mutates: refresh after success
-  function run(args, cb, mutates) {
+  // args: backend arguments; cb(result); mutates: refresh after success; input: optional stdin
+  function run(args, cb, mutates, input) {
     var cmd = [root.backendBin]
     for (var i = 0; i < args.length; i++) cmd.push(String(args[i]))
     var proc = actionProcComponent.createObject(root, {
       commandArgs: cmd,
+      input: input === undefined ? "" : input,
       callback: cb || null,
       mutates: mutates === true
     })
@@ -254,13 +255,19 @@ Item {
     Process {
       id: ap
       property var commandArgs: []
+      property string input: ""
       property var callback: null
       property bool mutates: false
 
       command: commandArgs
+      stdinEnabled: input.length > 0
       stdout: StdioCollector { id: apOut; waitForEnd: true }
 
       function start() { ap.running = true }
+
+      onStarted: {
+        if (ap.input.length > 0) ap.write(ap.input)
+      }
 
       onExited: function(exitCode) {
         var res = { "ok": false, "error": "Backend exited with " + exitCode }
