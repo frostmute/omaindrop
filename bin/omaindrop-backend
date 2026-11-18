@@ -649,7 +649,7 @@ def cmd_status(args):
 
 
 def cmd_set_token(args):
-    token = (args.token or sys.stdin.readline()).strip()
+    token = sys.stdin.readline().strip()
     if not token:
         return fail("Empty token.", "bad_input")
     if not args.no_check:
@@ -735,8 +735,7 @@ def build_parser():
     s = sub.add_parser("status", help="Token and config status")
     s.add_argument("--check", action="store_true", help="also verify the token with Raindrop")
 
-    s = sub.add_parser("set-token", help="Save a test token (arg or stdin)")
-    s.add_argument("token", nargs="?")
+    s = sub.add_parser("set-token", help="Read a test token from stdin and save it")
     s.add_argument("--no-check", action="store_true")
     return p
 
@@ -754,6 +753,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         return fail("Missing command. Try: count, recent, search, save, collections, tags.", "bad_input")
+    if argv[0] == "set-token" and any(arg not in ("--no-check", "-h", "--help") for arg in argv[1:]):
+        return fail("set-token reads the token from stdin.", "bad_input")
     try:
         args = parser.parse_args(argv)
     except SystemExit as e:

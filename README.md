@@ -77,10 +77,15 @@ Omaindrop talks to Raindrop with a personal **test token**:
 3. Open the app and click **Create test token**, then copy it.
 4. Click the Omaindrop icon in your bar and paste it into the popup — it's verified and saved for you.
 
-Prefer the terminal?
+In Bash, run this block and paste your token at the prompt:
 
 ```bash
-~/.config/omarchy/plugins/io.github.frostmute.omaindrop/bin/omaindrop-backend set-token <your-token>
+(
+  IFS= read -r -s -p "Raindrop token: " token || exit 1
+  printf '\n' >&2
+  builtin printf '%s\n' "$token" |
+    ~/.config/omarchy/plugins/io.github.frostmute.omaindrop/bin/omaindrop-backend set-token
+)
 ```
 
 Omaindrop looks for a token in this order, first hit wins:
@@ -169,7 +174,7 @@ Badge threshold lives with the widget in `~/.config/omarchy/shell.json`, e.g. `{
 | `collections` / `tags` | Nested collections with counts / tags by use |
 | `move ID COLLECTION` · `tag ID a,b [--append]` · `delete ID` | Triage |
 | `vault` · `pull [--vault NAME] [--dry-run]` | Make It Rain detection and hand-off |
-| `status [--check]` · `set-token TOKEN` | Token status / verify and store |
+| `status [--check]` · `set-token` (reads from stdin) | Token status / verify and store |
 
 ---
 

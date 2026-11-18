@@ -235,7 +235,7 @@ Panel {
                 enabled: tokenInput.text.trim().length > 0
                 onClicked: {
                   if (!root.client || !tokenInput.text.trim()) return
-                  root.client.run(["set-token", tokenInput.text.trim()], function(res) {
+                  root.client.run(["set-token"], function(res) {
                     if (res && res.ok) {
                       tokenInput.text = ""
                       root.client.tokenMissing = false
@@ -244,7 +244,7 @@ Panel {
                     } else {
                       root.showNotice((res && res.error) || "Token rejected")
                     }
-                  }, false)
+                  }, false, tokenInput.text.trim() + "\n")
                 }
               }
             }
