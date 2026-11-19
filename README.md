@@ -54,6 +54,7 @@
   - Strict `Text.PlainText` rendering for everything that comes from the web (titles, excerpts, notes, tags).
   - Standard-library Python bridge, no pip installs; every command answers with one JSON object.
   - Token file written `0600`; only `http(s)` links are ever saved or opened.
+  - Redirects strip credentials across origins; response bodies are size-bounded.
   - Last good counts and lists are cached, so the badge survives going offline.
   - Polls every 2 minutes — well under Raindrop's 120 requests/minute limit.
 

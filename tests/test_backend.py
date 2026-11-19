@@ -13,6 +13,9 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.machinery
+import importlib.util
+import urllib.request
 from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +42,8 @@ class FakeRaindrop:
         self.next_id = 100
         self.requests = []
         self.fail_with = None  # (status, headers)
+        self.redirect_with = None  # (status, target)
+        self.custom_payload = None  # (status, bytes, content_type)
 
     def collections(self):
         return [{"_id": 101, "title": "Gamedev", "count": 1, "sort": 0},
@@ -77,6 +82,25 @@ class Handler(BaseHTTPRequestHandler):
         FAKE.requests.append({"method": method, "path": path, "query": q, "body": raw,
                               "auth": self.headers.get("Authorization"),
                               "ctype": self.headers.get("Content-Type", "")})
+        if FAKE.redirect_with:
+            status, target = FAKE.redirect_with
+            FAKE.redirect_with = None
+            self.send_response(status)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if FAKE.custom_payload:
+            status, payload_bytes, ctype = FAKE.custom_payload
+            FAKE.custom_payload = None
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload_bytes)))
+            self.end_headers()
+            self.wfile.write(payload_bytes)
+            return
+        if path == "/public-target":
+            return self._send(200, {"result": True, "user": {"fullName": "Public", "pro": True}})
         if FAKE.fail_with:
             status, headers = FAKE.fail_with
             return self._send(status, {"result": False, "errorMessage": "nope"}, headers)
@@ -399,6 +423,74 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         with open(path + ".tmp") as fh:
             self.assertEqual(fh.read(), "existing data")
+
+    def test_cross_origin_redirect_strips_bearer_token(self):
+        FAKE.redirect_with = (302, "http://localhost:%d/rest/v1/public-target" % self.port)
+        d = self.run_backend("status", "--check")
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(FAKE.requests), 2)
+        self.assertEqual(FAKE.requests[-2]["auth"], "Bearer " + TOKEN)
+        self.assertIsNone(FAKE.requests[-1]["auth"])
+
+    def test_same_origin_redirect_preserves_bearer_token(self):
+        FAKE.redirect_with = (302, "http://127.0.0.1:%d/rest/v1/public-target" % self.port)
+        d = self.run_backend("status", "--check")
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(FAKE.requests), 2)
+        self.assertEqual(FAKE.requests[-2]["auth"], "Bearer " + TOKEN)
+        self.assertEqual(FAKE.requests[-1]["auth"], "Bearer " + TOKEN)
+
+    def test_response_size_limit_on_success(self):
+        FAKE.custom_payload = (200, b'{"result": true, "items": "' + b'x' * 2000 + b'"}', "application/json")
+        d = self.run_backend("count", OMAINDROP_MAX_RESPONSE_SIZE="500")
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["code"], "bad_response")
+        self.assertIn("exceeded size limit", d["error"])
+
+    def test_response_size_limit_on_error(self):
+        FAKE.custom_payload = (400, b'{"result": false, "errorMessage": "' + b'e' * 2000 + b'"}', "application/json")
+        d = self.run_backend("count", OMAINDROP_MAX_RESPONSE_SIZE="500")
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["code"], "http_error")
+
+    def test_raindrop_redirect_handler_cross_origin_strips_auth(self):
+        loader = importlib.machinery.SourceFileLoader("backend_mod", BACKEND)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        backend = importlib.util.module_from_spec(spec)
+        loader.exec_module(backend)
+
+        handler = backend.RaindropRedirectHandler()
+        req = urllib.request.Request("https://api.raindrop.io/rest/v1/user",
+                                     headers={"Authorization": "Bearer secret-token"})
+        new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://evil.attacker.com/steal")
+        self.assertIsNotNone(new_req)
+        self.assertNotIn("Authorization", new_req.headers)
+        self.assertNotIn("Authorization", new_req.unredirected_hdrs)
+
+    def test_raindrop_redirect_handler_refuses_https_downgrade(self):
+        loader = importlib.machinery.SourceFileLoader("backend_mod", BACKEND)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        backend = importlib.util.module_from_spec(spec)
+        loader.exec_module(backend)
+
+        handler = backend.RaindropRedirectHandler()
+        req = urllib.request.Request("https://api.raindrop.io/rest/v1/user",
+                                     headers={"Authorization": "Bearer secret-token"})
+        new_req = handler.redirect_request(req, None, 302, "Found", {}, "http://api.raindrop.io/rest/v1/user")
+        self.assertIsNone(new_req)
+
+    def test_raindrop_redirect_handler_refuses_non_http_schemes(self):
+        loader = importlib.machinery.SourceFileLoader("backend_mod", BACKEND)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        backend = importlib.util.module_from_spec(spec)
+        loader.exec_module(backend)
+
+        handler = backend.RaindropRedirectHandler()
+        req = urllib.request.Request("https://api.raindrop.io/rest/v1/user",
+                                     headers={"Authorization": "Bearer secret-token"})
+        for bad_url in ("file:///etc/passwd", "javascript:alert(1)", "ftp://example.com/foo"):
+            new_req = handler.redirect_request(req, None, 302, "Found", {}, bad_url)
+            self.assertIsNone(new_req, bad_url)
 
     # --- make it rain
 
