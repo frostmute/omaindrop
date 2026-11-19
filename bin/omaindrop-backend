@@ -34,6 +34,7 @@ TOKEN_FILE = os.environ.get("RAINDROP_TOKEN_FILE") or os.path.join(XDG_CONFIG, "
 CACHE_PATH = os.path.join(XDG_CACHE, "omaindrop", "state.json")
 OBSIDIAN_CONFIG = os.environ.get("OMAINDROP_OBSIDIAN_CONFIG") or os.path.join(XDG_CONFIG, "obsidian", "obsidian.json")
 TIMEOUT = float(os.environ.get("OMAINDROP_TIMEOUT", "15"))
+MAX_RESPONSE_SIZE = int(os.environ.get("OMAINDROP_MAX_RESPONSE_SIZE", str(2 * 1024 * 1024)))
 
 UNSORTED = -1
 ALL = 0
@@ -184,11 +185,54 @@ def write_cache(key, value):
 
 # ---------------------------------------------------------------- http
 
+def read_response_body(stream, limit=MAX_RESPONSE_SIZE):
+    if stream is None:
+        return b"", False
+    chunks = []
+    total = 0
+    while total <= limit:
+        chunk = stream.read(min(65536, limit - total + 1))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > limit:
+        return b"", True
+    return b"".join(chunks), False
+
+
+class RaindropRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent leaking credentials across origins and enforce safe redirect schemes."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        orig = urllib.parse.urlsplit(req.full_url)
+        dest = urllib.parse.urlsplit(newurl)
+        if dest.scheme not in ("http", "https"):
+            return None
+        # Disallow scheme downgrade from https to http
+        if orig.scheme == "https" and dest.scheme != "https":
+            return None
+        # Restrict credential-bearing requests to the intended origin (Suggested-by: @HANCORE-linux)
+        if (orig.scheme, orig.netloc.lower()) != (dest.scheme, dest.netloc.lower()):
+            for k in list(new_req.headers.keys()):
+                if k.lower() == "authorization":
+                    del new_req.headers[k]
+            for k in list(new_req.unredirected_hdrs.keys()):
+                if k.lower() == "authorization":
+                    del new_req.unredirected_hdrs[k]
+        return new_req
+
+
 class Raindrop:
-    def __init__(self, token, base=API_BASE, timeout=TIMEOUT):
+    def __init__(self, token, base=API_BASE, timeout=TIMEOUT, max_response_size=MAX_RESPONSE_SIZE):
         self.token = token
         self.base = base
         self.timeout = timeout
+        self.max_response_size = max_response_size
+        self.opener = urllib.request.build_opener(RaindropRedirectHandler())
 
     def request(self, method, path, params=None, body=None, raw=None, content_type=None):
         url = self.base + path
@@ -210,12 +254,32 @@ class Raindrop:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                text = resp.read().decode("utf-8", "replace")
+            with self.opener.open(req, timeout=self.timeout) as resp:
+                cl = resp.headers.get("Content-Length") if resp.headers else None
+                if cl:
+                    try:
+                        if int(cl) > self.max_response_size:
+                            raise BackendError(
+                                "Raindrop response exceeded size limit (%d bytes)." % self.max_response_size,
+                                "bad_response",
+                            )
+                    except (ValueError, TypeError):
+                        pass
+                raw_bytes, exceeded = read_response_body(resp, self.max_response_size)
+                if exceeded:
+                    raise BackendError(
+                        "Raindrop response exceeded size limit (%d bytes)." % self.max_response_size,
+                        "bad_response",
+                    )
+                text = raw_bytes.decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             detail = ""
             try:
-                detail = json.loads(e.read().decode("utf-8", "replace")).get("errorMessage", "")
+                cl = e.headers.get("Content-Length") if e.headers else None
+                if not (cl and int(cl) > self.max_response_size):
+                    err_bytes, exceeded = read_response_body(e, self.max_response_size)
+                    if not exceeded and err_bytes:
+                        detail = json.loads(err_bytes.decode("utf-8", "replace")).get("errorMessage", "")
             except Exception:
                 pass
             if e.code == 401:
